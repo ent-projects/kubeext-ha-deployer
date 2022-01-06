@@ -124,6 +124,7 @@ available steps:
 examples: ./ezctl setup test-k8s 01  (or ./ezctl setup test-k8s prepare)
 	  ./ezctl setup test-k8s 02  (or ./ezctl setup test-k8s etcd)
           ./ezctl setup test-k8s all
+          ./ezctl setup test-k8s 04 -t restart_master
 EOF
 }
 
@@ -131,7 +132,7 @@ EOF
 
 function new() {
     # check if already existed
-    [[ -d "clusters/$1" ]] && { logger error "cluster:$1 already existed, if cluster:$1 setup failed, try 'rm -rf clusters/$1' first!"; exit 1; }
+    [[ -d "clusters/$1" ]] && { logger error "cluster:$1 already existed, if cluster:$1 setup failed, try 'rm -rf $BASE/clusters/$1' first!"; exit 1; }
 
     logger debug "generate custom cluster files in $BASE/clusters/$1"
     mkdir -p "clusters/$1"
@@ -139,7 +140,8 @@ function new() {
     sed -i "s/_cluster_name_/$1/g" "clusters/$1/hosts"
     cp example/config.yml "clusters/$1/config.yml"
 
-    logger debug "set version of common plugins"
+    logger debug "set versions"
+    k8sVer=$(grep 'K8S_BIN_VER=v' ezdown|cut -d'v' -f2)
     calicoVer=$(grep 'calicoVer=' ezdown|cut -d'=' -f2)
     ciliumVer=$(grep 'ciliumVer=' ezdown|cut -d'=' -f2)
     flannelVer=$(grep 'flannelVer=' ezdown|cut -d'=' -f2)
@@ -151,6 +153,7 @@ function new() {
     dashboardMetricsScraperVer=$(grep 'dashboardMetricsScraperVer=' ezdown|cut -d'=' -f2)
     metricsVer=$(grep 'metricsVer=' ezdown|cut -d'=' -f2)
     nfsProvisionerVer=$(grep 'nfsProvisionerVer=' ezdown|cut -d'=' -f2)
+    pauseVer=$(grep 'pauseVer=' ezdown|cut -d'=' -f2)
     promChartVer=$(grep 'promChartVer=' ezdown|cut -d'=' -f2)
     traefikChartVer=$(grep 'traefikChartVer=' ezdown|cut -d'=' -f2)
     harborVer=$(grep 'HARBOR_VER=' ezdown|cut -d'=' -f2)
@@ -158,12 +161,14 @@ function new() {
 
     grep registry-mirrors /etc/docker/daemon.json > /dev/null 2>&1 || { logger debug "disable registry mirrors"; registryMirror=false; }
 
-    sed -i -e "s/__flannel__/$flannelVer/g" \
+    sed -i -e "s/__k8s_ver__/$k8sVer/g" \
+           -e "s/__flannel__/$flannelVer/g" \
 	   -e "s/__calico__/$calicoVer/g" \
 	   -e "s/__cilium__/$ciliumVer/g" \
 	   -e "s/__kube_ovn__/$kubeOvnVer/g" \
 	   -e "s/__kube_router__/$kubeRouterVer/g" \
 	   -e "s/__coredns__/$corednsVer/g" \
+	   -e "s/__pause__/$pauseVer/g" \
 	   -e "s/__dns_node_cache__/$dnsNodeCacheVer/g" \
 	   -e "s/__dashboard__/$dashboardVer/g" \
 	   -e "s/__dash_metrics__/$dashboardMetricsScraperVer/g" \
@@ -183,6 +188,9 @@ function new() {
 function setup() {
     [[ -d "clusters/$1" ]] || { logger error "invalid config, run 'ezctl new $1' first"; return 1; }
     [[ -f "bin/kube-apiserver" ]] || { logger error "no binaries founded, run 'ezdown -D' fist"; return 1; }
+
+    # for extending usage
+    EXTRA_ARGS=$(echo "$*"|sed "s/$1 $2//g"|sed "s/^ *//g")
 
     PLAY_BOOK="dummy.yml"
     case "$2" in
@@ -222,10 +230,13 @@ function setup() {
           ;;
     esac
 
+    COMMAND="ansible-playbook -i clusters/$1/hosts -e @clusters/$1/config.yml $EXTRA_ARGS playbooks/$PLAY_BOOK"
+    echo "$COMMAND"
+
     logger info "cluster:$1 setup step:$2 begins in 5s, press any key to abort:\n"
     ! (read -r -t5 -n1) || { logger warn "setup abort"; return 1; }
 
-    ansible-playbook -i "clusters/$1/hosts" -e "@clusters/$1/config.yml" "playbooks/$PLAY_BOOK" || return 1
+    ${COMMAND} || return 1
 }
 
 function cmd() {
@@ -257,10 +268,13 @@ function cmd() {
           ;;
     esac
 
+    COMMAND="ansible-playbook -i clusters/$1/hosts -e @clusters/$1/config.yml playbooks/$PLAY_BOOK"
+    echo "$COMMAND"
+
     logger info "cluster:$1 $2 begins in 5s, press any key to abort:\n"
     ! (read -r -t5 -n1) || { logger warn "$2 abort"; return 1; }
 
-    ansible-playbook -i "clusters/$1/hosts" -e "@clusters/$1/config.yml" "playbooks/$PLAY_BOOK" || return 1
+    ${COMMAND} || return 1
 }
 
 
@@ -329,6 +343,9 @@ function add-master() {
 
     logger info "reconfigure and restart 'kube-lb' service"
     ansible-playbook -i "$BASE/clusters/$1/hosts" "$BASE/playbooks/90.setup.yml" -t restart_kube-lb -e "@clusters/$1/config.yml" 
+
+    logger info "reconfigure and restart 'ex-lb' service"
+    ansible-playbook -i "$BASE/clusters/$1/hosts" "$BASE/playbooks/10.ex-lb.yml" -t restart_lb -e "@clusters/$1/config.yml"
 }
 
 function add-etcd() {
@@ -395,6 +412,9 @@ function del-master() {
 
     logger info "reconfigure and restart 'kube-lb' service"
     ansible-playbook -i "$BASE/clusters/$1/hosts" "$BASE/playbooks/90.setup.yml" -t restart_kube-lb -e "@clusters/$1/config.yml" 
+
+    logger info "reconfigure and restart 'ex-lb' service"
+    ansible-playbook -i "$BASE/clusters/$1/hosts" "$BASE/playbooks/10.ex-lb.yml" -t restart_lb -e "@clusters/$1/config.yml"
 }
 
 
@@ -403,7 +423,7 @@ function start-aio(){
     # Check ENV 'HOST_IP', exists if the CMD 'ezctl' running in a docker container
     if [[ -z $HOST_IP ]];then
         # ezctl runs in a host machine, get host's ip
-        HOST_IF=$(ip route|grep default|cut -d' ' -f5)
+        HOST_IF=$(ip route|grep default|head -n1|cut -d' ' -f5)
         HOST_IP=$(ip a|grep "$HOST_IF$"|head -n1|awk '{print $2}'|cut -d'/' -f1)
     fi
     set -u
@@ -572,7 +592,7 @@ function main() {
           new "$2"
           ;;
       (setup)
-          [ "$#" -eq 3 ] || { usage-setup >&2; exit 2; }
+          [ "$#" -ge 3 ] || { usage-setup >&2; exit 2; }
           setup "${@:2}"
           ;;
       (start)
